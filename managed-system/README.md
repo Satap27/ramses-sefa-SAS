@@ -61,6 +61,13 @@ The simulated third-party services are hosted on Vercel and they are available a
 
 Check the `application.properties` files of each microservice for the default properties. If you want to change the default properties and the environmental variables of a service, you need to manually create the container to override the default properties.
 
+### OWASP Dependency-Check
+
+In order for OWASP to function correctly, it's necessary to [set an API key](https://nvd.nist.gov/developers/request-an-api-key) to query the NIST database. Create a `gradle.properties` file in the root of the project and insert the following line:
+```
+owasp.apiKey=<API_KEY>
+```
+
 
 ## EXTRA
 

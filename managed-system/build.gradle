@@ -11,7 +11,7 @@ buildscript {
 		mavenCentral()
 	}
 	dependencies {
-		classpath 'org.owasp:dependency-check-gradle:8.4.2'
+		classpath 'org.owasp:dependency-check-gradle:9.0.9'
 	}
 }
 
@@ -39,11 +39,26 @@ abstract class ExtractVulnScores extends DefaultTask {
 		def dependencies = report.dependencies
 		dependencies.each { dependency ->
 			if (dependency.vulnerabilities) {
-				def vulnerabilityReport = [:]
-				def baseScores = dependency.vulnerabilities.collect { it.cvssv3?.baseScore }
-				vulnerabilityReport[dependency.fileName] = baseScores
-				subprojectReport[project.name] = subprojectReport.getOrDefault(project.name, []) + vulnerabilityReport
-				println("Dependency: ${dependency.fileName}, Base Scores: $baseScores")
+				def dependencyReport = [:]
+
+				dependency.vulnerabilities.each { vulnerability ->
+					def vulnerabilityReport = [:]
+					def baseScore = vulnerability.cvssv3?.baseScore
+
+					def flags = [:]
+					flags['disputed'] = vulnerability.description?.contains("** DISPUTED **")
+					flags['rejected'] = vulnerability.description?.contains("Rejected reason")
+
+					vulnerabilityReport[vulnerability.name] = [
+							baseScore: baseScore,
+							flags: flags
+					]
+					dependencyReport[dependency.fileName] = dependencyReport.getOrDefault(dependency.fileName, []) + vulnerabilityReport
+				}
+
+
+				subprojectReport[project.name] = subprojectReport.getOrDefault(project.name, []) + dependencyReport
+				println("Dependency: ${dependency.fileName}, Vulnerabilities: ${dependency.vulnerabilities.size}")
 			}
 		}
 
@@ -62,17 +77,10 @@ plugins {
 	id "io.spring.dependency-management" version "${SPRING_DEPENDENCY_MANAGEMENT_VERSION}"
 }
 
-allprojects {
-	apply plugin: 'org.owasp.dependencycheck'
-
-	dependencyCheck {
-		format='ALL'
-	}
-}
-
-tasks.register('mergeVulnScores', Copy) {
+tasks.register('generateMergedVulnScores', Copy) {
 	description = 'Merge vuln-scores reports from subprojects into a single report'
-	from subprojects.collect { project ->
+
+	from subprojects.findAll { it.tasks.names.contains("extractVulnScores") }.collect { project ->
 		project.file("${project.buildDir}/vulnerability-scores.json")
 	}
 	into project.buildDir
@@ -106,16 +114,11 @@ tasks.register('mergeVulnScores', Copy) {
 		def jsonContent = jsonBuilder.toPrettyString()
 
 		// Write the merged report to a file
-		def mergedJsonFile = new File("${project.buildDir}/merged-vulnerability-scores.json")
+		def mergedJsonFile = new File("${project.buildDir}/vulnerabilities.json")
 		mergedJsonFile.text = jsonContent
 
 		println "Merged vuln-scores report saved to: ${mergedJsonFile}"
 	}
-}
-
-tasks.register('extractVulnScores') {
-	dependsOn dependencyCheckAnalyze
-	dependsOn subprojects.extractVulnScores
 }
 
 subprojects {
@@ -129,13 +132,27 @@ subprojects {
 		mavenCentral()
 	}
 
-	tasks.register('extractVulnScores', ExtractVulnScores) {
-		jsonFilePath = "${project.buildDir}/reports/dependency-check-report.json"
-	}
-
 	if (project.name.endsWith("-service")) {
 		apply plugin: "org.springframework.boot"
 		apply plugin: "io.spring.dependency-management"
+		apply plugin: "org.owasp.dependencycheck"
+
+		if (project.name != "web-service" && project.name != "api-gateway-service") {
+			dependencyCheck {
+				nvd {
+					apiKey = findProperty("owasp.apiKey")
+				}
+				format = 'ALL'
+			}
+
+			tasks.register('extractVulnScores', ExtractVulnScores) {
+				jsonFilePath = "${project.buildDir}/reports/dependency-check-report.json"
+			}
+
+			tasks.named("extractVulnScores") {
+				dependsOn dependencyCheckAnalyze
+			}
+		}
 
 		dependencyManagement {
 			imports {
@@ -174,8 +191,5 @@ subprojects {
 		tasks.named("test") {
 			useJUnitPlatform()
 		}
-
 	}
-
 }
-
