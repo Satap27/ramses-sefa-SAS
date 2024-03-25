@@ -1,12 +1,124 @@
-buildscript { ext {
-	set('SPRING_BOOT_VERSION', '2.7.3')
-	set('SPRING_CLOUD_VERSION', '2021.0.3')
-	set('SPRING_DEPENDENCY_MANAGEMENT_VERSION', '1.0.13.RELEASE')
-}}
+import groovy.json.JsonBuilder
+import groovy.json.JsonSlurper
+
+buildscript {
+	ext {
+		set('SPRING_BOOT_VERSION', '2.7.3')
+		set('SPRING_CLOUD_VERSION', '2021.0.3')
+		set('SPRING_DEPENDENCY_MANAGEMENT_VERSION', '1.0.13.RELEASE')
+	}
+	repositories {
+		mavenCentral()
+	}
+	dependencies {
+		classpath 'org.owasp:dependency-check-gradle:9.0.9'
+	}
+}
+
+abstract class ExtractVulnScores extends DefaultTask {
+	@Input
+	String jsonFilePath
+
+	@TaskAction
+	void analyzeDependencies() {
+		if (jsonFilePath == null) {
+			throw new IllegalArgumentException("Please provide the path to the JSON report file.")
+		}
+
+		if (!project.file(jsonFilePath).exists()) {
+			throw new IllegalArgumentException("JSON report file does not exist: $jsonFilePath")
+		}
+
+		// Read and parse the JSON report
+		def jsonSlurper = new JsonSlurper()
+		def report = jsonSlurper.parseText(project.file(jsonFilePath).text)
+
+		def subprojectReport = [:]
+
+		// Extract base scores of vulnerabilities for each dependency
+		def dependencies = report.dependencies
+		dependencies.each { dependency ->
+			if (dependency.vulnerabilities) {
+				def dependencyReport = [:]
+
+				dependency.vulnerabilities.each { vulnerability ->
+					def vulnerabilityReport = [:]
+					def baseScore = vulnerability.cvssv3?.baseScore
+
+					def flags = [:]
+					flags['disputed'] = vulnerability.description?.contains("** DISPUTED **")
+					flags['rejected'] = vulnerability.description?.contains("Rejected reason")
+
+					vulnerabilityReport[vulnerability.name] = [
+							baseScore: baseScore,
+							flags: flags
+					]
+					dependencyReport[dependency.fileName] = dependencyReport.getOrDefault(dependency.fileName, []) + vulnerabilityReport
+				}
+
+
+				subprojectReport[project.name] = subprojectReport.getOrDefault(project.name, []) + dependencyReport
+				println("Dependency: ${dependency.fileName}, Vulnerabilities: ${dependency.vulnerabilities.size}")
+			}
+		}
+
+		// Convert the map to JSON
+		def jsonBuilder = new JsonBuilder(subprojectReport)
+		def jsonContent = jsonBuilder.toPrettyString()
+
+		// Write the JSON content to a file
+		def outputJsonFile = new File("${project.buildDir}/vulnerability-scores.json")
+		outputJsonFile.text = jsonContent
+	}
+}
 
 plugins {
 	id "org.springframework.boot" version "${SPRING_BOOT_VERSION}"
 	id "io.spring.dependency-management" version "${SPRING_DEPENDENCY_MANAGEMENT_VERSION}"
+}
+
+tasks.register('generateMergedVulnScores', Copy) {
+	description = 'Merge vuln-scores reports from subprojects into a single report'
+
+	from subprojects.findAll { it.tasks.names.contains("extractVulnScores") }.collect { project ->
+		project.file("${project.buildDir}/vulnerability-scores.json")
+	}
+	into project.buildDir
+	eachFile { fileCopyDetails ->
+		// Rename the file to include the subproject name
+		fileCopyDetails.path = "${fileCopyDetails.file.parentFile.parentFile.name}-${fileCopyDetails.name}"
+	}
+	includeEmptyDirs = false
+
+	doLast {
+		// Collect all the JSON files
+		def jsonFiles = fileTree(dir: project.buildDir, include: '**/*-vulnerability-scores.json').files
+
+		// Create a map to store the merged data
+		def mergedReport = [:]
+
+		// Merge the data from all subprojects
+		jsonFiles.each { jsonFile ->
+			def jsonSlurper = new JsonSlurper()
+			def subprojectData = jsonSlurper.parse(jsonFile)
+
+			// Merge the data into the main report
+			subprojectData.each { subprojectName, vulnerabilityData ->
+				// Ensure mergedReport[subprojectName] is a list to handle duplicates
+				mergedReport[subprojectName] = mergedReport.getOrDefault(subprojectName, []) + vulnerabilityData
+			}
+		}
+
+		// Convert the merged data to JSON
+		def jsonBuilder = new JsonBuilder(mergedReport)
+		def jsonContent = jsonBuilder.toPrettyString()
+
+		// Write the merged report to a file
+		def mergedJsonFile = new File("${project.buildDir}/vulnerabilities.json")
+		mergedJsonFile.text = jsonContent
+
+		println "Merged vuln-scores report saved to: ${mergedJsonFile}"
+	}
 }
 
 subprojects {
@@ -23,6 +135,24 @@ subprojects {
 	if (project.name.endsWith("-service")) {
 		apply plugin: "org.springframework.boot"
 		apply plugin: "io.spring.dependency-management"
+		apply plugin: "org.owasp.dependencycheck"
+
+		if (project.name != "web-service" && project.name != "api-gateway-service") {
+			dependencyCheck {
+				nvd {
+					apiKey = findProperty("owasp.apiKey")
+				}
+				format = 'ALL'
+			}
+
+			tasks.register('extractVulnScores', ExtractVulnScores) {
+				jsonFilePath = "${project.buildDir}/reports/dependency-check-report.json"
+			}
+
+			tasks.named("extractVulnScores") {
+				dependsOn dependencyCheckAnalyze
+			}
+		}
 
 		dependencyManagement {
 			imports {
@@ -61,8 +191,5 @@ subprojects {
 		tasks.named("test") {
 			useJUnitPlatform()
 		}
-
 	}
-
 }
-
