@@ -3,6 +3,7 @@ RUN mkdir /app
 WORKDIR /app
 COPY build/libs/*-latest.jar ./spring-boot-application.jar
 COPY or-tools .
+COPY prism .
 ENTRYPOINT ["java","-jar","/app/spring-boot-application.jar","/app"]
 
 ENV KNOWLEDGE_URL=http://ramses-knowledge:58005

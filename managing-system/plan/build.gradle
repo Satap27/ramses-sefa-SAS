@@ -2,4 +2,5 @@ dependencies {
     implementation project(':knowledge')
     implementation fileTree(dir: '../libs', include: ['**/build/libs/*.jar'])
     implementation 'com.google.ortools:ortools-java:9.8.3296'
+    implementation 'com.google.code.gson:gson:2.9.0'
 }

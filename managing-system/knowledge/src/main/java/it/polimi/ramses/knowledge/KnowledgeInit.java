@@ -5,7 +5,6 @@ import it.polimi.ramses.knowledge.domain.architecture.InstanceStatus;
 import it.polimi.ramses.knowledge.domain.architecture.ServiceConfiguration;
 import it.polimi.ramses.knowledge.domain.persistence.ConfigurationRepository;
 import it.polimi.ramses.knowledge.domain.persistence.Vulnerability;
-import it.polimi.ramses.knowledge.domain.persistence.VulnerabilityRepository;
 import it.polimi.ramses.knowledge.externalinterfaces.ProbeClient;
 import it.polimi.ramses.knowledge.externalinterfaces.ServiceInfo;
 import it.polimi.ramses.knowledge.parser.QoSParser;
@@ -37,8 +36,6 @@ public class KnowledgeInit implements InitializingBean {
     private ProbeClient probeClient;
     @Autowired
     private Environment environment;
-    @Autowired
-    private VulnerabilityRepository vulnerabilityRepository;
 
 
     @Override
@@ -61,15 +58,17 @@ public class KnowledgeInit implements InitializingBean {
         serviceList.forEach(service ->
                 service.getPossibleImplementations().forEach((serviceImplementationId, serviceImplementation) -> {
                     List<Vulnerability> vulnerabilities = servicesVulnerabilities.get(serviceImplementationId);
-                    // TODO compute the score not as the sum of the scores
-                    double score = vulnerabilities.stream().mapToDouble(Vulnerability::getScore).sum();
+
+                    double score = vulnerabilities.stream()
+                            .filter(v -> !v.isDisputed() && !v.isRejected())
+                            .sorted((v1, v2) -> Double.compare(v2.getScore(), v1.getScore()))
+                            .limit(10)
+                            .mapToDouble(Vulnerability::getScore)
+                            .sum();
+
                     log.info("Service {} implementation {} vulnerability score: {}", service.getServiceId(), serviceImplementationId, score);
                     serviceImplementation.setVulnerabilityScore(score);
                 }));
-
-        // Save vulnerabilities in the database
-        vulnerabilityRepository.deleteAll();
-        servicesVulnerabilities.forEach((serviceId, vulnerabilities) -> vulnerabilityRepository.saveAll(vulnerabilities));
 
         Map<String, ServiceInfo> probeSystemRuntimeArchitecture = probeClient.getSystemArchitecture();
 

@@ -7,6 +7,7 @@ import it.polimi.ramses.knowledge.domain.adaptation.specifications.QoSSpecificat
 import it.polimi.ramses.knowledge.domain.adaptation.specifications.Availability;
 import it.polimi.ramses.knowledge.domain.adaptation.specifications.AverageResponseTime;
 import it.polimi.ramses.knowledge.domain.adaptation.specifications.Vulnerability;
+import it.polimi.ramses.knowledge.domain.adaptation.values.QoSHistory;
 import it.polimi.ramses.knowledge.domain.architecture.*;
 import it.polimi.ramses.plan.externalInterfaces.ExecuteClient;
 import it.polimi.ramses.plan.externalInterfaces.KnowledgeClient;
@@ -14,9 +15,13 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.lang.Nullable;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
+
+import static it.polimi.ramses.plan.utils.PrismModelChecker.convertJsonToPrism;
 
 @Slf4j
 @org.springframework.stereotype.Service
@@ -39,6 +44,10 @@ public class PlanService {
             log.info("\nStarting plan");
             knowledgeClient.notifyModuleStart(Modules.PLAN);
             Map<String, Service> servicesMap = knowledgeClient.getServicesMap();
+
+            String currentGraph = jsonGraph(servicesMap, null);
+            log.debug("Current graph: {}", currentGraph);
+
             Map<String, List<AdaptationOption>> proposedAdaptationOptions = knowledgeClient.getProposedAdaptationOptions();
             Map<String, List<AdaptationOption>> chosenAdaptationOptions = new HashMap<>();
 
@@ -76,7 +85,7 @@ public class PlanService {
                                 handleChangeImplementation((ChangeImplementationOption) option, servicesMap.get(option.getServiceId()));
                         }
 
-                        AdaptationOption chosenOption = extractBestOption(servicesMap.get(serviceId), proposedAdaptationOptions.get(serviceId).stream().filter(option -> !option.getClass().equals(ChangeLoadBalancerWeightsOption.class) || ((ChangeLoadBalancerWeightsOption)option).getNewWeights()!=null).collect(Collectors.toList()));
+                        AdaptationOption chosenOption = buildPossibleGraphs(servicesMap, proposedAdaptationOptions, currentGraph);
                         if (chosenOption != null)
                             chosenAdaptationOptionList.add(chosenOption);
                     }
@@ -100,6 +109,7 @@ public class PlanService {
                     if (!chosenAdaptationOptionList.isEmpty())
                         chosenAdaptationOptions.put(serviceId, chosenAdaptationOptionList);
                 });
+
                 Set<String> servicesAlreadyProcessed = new HashSet<>();
                 servicesMap.forEach((serviceId, service) -> {
                     if (service.isInTransitionState() || chosenAdaptationOptions.containsKey(serviceId)) {
@@ -116,6 +126,33 @@ public class PlanService {
             e.printStackTrace();
             throw new RuntimeException("Error during the plan execution", e);
         }
+    }
+
+    private AdaptationOption buildPossibleGraphs(Map<String, Service> servicesMap, Map<String, List<AdaptationOption>> proposedAdaptationOptions, String currentGraph) {
+        Double currentValue = convertJsonToPrism(currentGraph, currentGraph);
+        AtomicReference<Double> best = new AtomicReference<>(currentValue);
+        AtomicReference<AdaptationOption> bestOption = new AtomicReference<>(null);
+
+        proposedAdaptationOptions.forEach((s, adaptationOptions) ->
+                adaptationOptions.forEach(adaptationOption -> {
+                    Map<String, Service> serviceMapCopy = new HashMap<>(servicesMap);
+                    if (adaptationOption.getClass().equals(ChangeImplementationOption.class)) {
+                        ChangeImplementationOption changeImplementationOption = (ChangeImplementationOption) adaptationOption;
+                        Service service = serviceMapCopy.get(changeImplementationOption.getServiceId());
+                        ServiceImplementation newImplementation = service.getPossibleImplementations().get(changeImplementationOption.getNewImplementationId());
+                        newImplementation.setInstances(service.getCurrentImplementation().getInstances());
+                        service.setCurrentImplementationId(newImplementation.getImplementationId());
+                        serviceMapCopy.put(service.getServiceId(), service);
+                    }
+                    String graph = jsonGraph(serviceMapCopy, adaptationOption);
+                    log.debug("Graph for option {}: {}", adaptationOption.getDescription(), graph);
+                    Double value = convertJsonToPrism(currentGraph, graph);
+                    if (value != null && value < best.get()) {
+                        best.set(value);
+                        bestOption.set(adaptationOption);
+                    }
+                }));
+        return bestOption.get();
     }
 
     private void invalidateQoSHistoryOfServiceAndDependants(Map<String, Service> servicesMap, String serviceId, Set<String> servicesAlreadyProcessed) {
@@ -368,151 +405,6 @@ public class PlanService {
         return changeImplementationOption;
     }
 
-    //Right now, this function is called only if there are no forced adaptation options
-    public AdaptationOption extractBestOption(Service service, List<AdaptationOption> toCompare) {
-        if (toCompare.size() == 0)
-            return null;
-        Map<Class<? extends QoSSpecification>, Double> benefits = new HashMap<>();
-        Map<Class<? extends QoSSpecification>, AdaptationOption> bestOptionForGoal = new HashMap<>();
-        log.debug("{}: Extracting best option from {} options", service.getServiceId(), toCompare.size());
-
-        for (AdaptationOption adaptationOption : toCompare) {
-            List<Instance> instances = service.getInstances();
-            if (adaptationOption.getQosGoal() == Availability.class) {
-                double availabilityEstimation = 0.0;
-                if (service.getConfiguration().getLoadBalancerType() == ServiceConfiguration.LoadBalancerType.WEIGHTED_RANDOM) {
-                    if (ChangeLoadBalancerWeightsOption.class.equals(adaptationOption.getClass())) {
-                        ChangeLoadBalancerWeightsOption changeLoadBalancerWeightsOption = (ChangeLoadBalancerWeightsOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if (!changeLoadBalancerWeightsOption.getInstancesToShutdownIds().contains(instance.getInstanceId()))
-                                availabilityEstimation += changeLoadBalancerWeightsOption.getNewWeights().get(instance.getInstanceId()) * instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
-                        }
-                    }
-                    else if (AddInstanceOption.class.equals(adaptationOption.getClass())) {
-                        AddInstanceOption addInstanceOption = (AddInstanceOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if (!addInstanceOption.getInstancesToShutdownIds().contains(instance.getInstanceId()))
-                                availabilityEstimation += addInstanceOption.getOldInstancesNewWeights().get(instance.getInstanceId()) * instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
-                        }
-                        availabilityEstimation += addInstanceOption.getNewInstanceWeight() * service.getCurrentImplementation().getBenchmark(Availability.class);
-                    } else if (ShutdownInstanceOption.class.equals(adaptationOption.getClass())) {
-                        ShutdownInstanceOption shutdownInstanceOption = (ShutdownInstanceOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if (!instance.getInstanceId().equals(shutdownInstanceOption.getInstanceToShutdownId()))
-                                availabilityEstimation += shutdownInstanceOption.getNewWeights().get(instance.getInstanceId()) * instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
-                        }
-                    }
-                }
-                else {
-                    if (AddInstanceOption.class.equals(adaptationOption.getClass())) {
-                        for (Instance instance : instances) {
-                            availabilityEstimation += instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
-                        }
-                        availabilityEstimation += service.getCurrentImplementation().getBenchmark(Availability.class);
-                        availabilityEstimation /= instances.size() + 1;
-                    } else if (ShutdownInstanceOption.class.equals(adaptationOption.getClass())) {
-                        ShutdownInstanceOption shutdownInstanceOption = (ShutdownInstanceOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if (!instance.getInstanceId().equals(shutdownInstanceOption.getInstanceToShutdownId()))
-                                availabilityEstimation += instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
-                        }
-                        availabilityEstimation /= instances.size() - 1;
-                    }
-                }
-                if (ChangeImplementationOption.class.equals(adaptationOption.getClass())) {
-                    ChangeImplementationOption changeImplementationOption = (ChangeImplementationOption) adaptationOption;
-                    availabilityEstimation = service.getPossibleImplementations().get(changeImplementationOption.getNewImplementationId()).getBenchmark(Availability.class);
-                }
-                double newBenefit = availabilityEstimation / service.getCurrentValueForQoS(Availability.class).getDoubleValue();
-                log.debug(service.getServiceId() + ": " + adaptationOption.getClass().getSimpleName() + " option for Availability. BENEFIT: " + newBenefit);
-
-                if (newBenefit > 1 && (!benefits.containsKey(Availability.class) || newBenefit > benefits.get(Availability.class))) {
-                    benefits.put(Availability.class, newBenefit);
-                    bestOptionForGoal.put(Availability.class, adaptationOption);
-                }
-            }
-            else if(adaptationOption.getQosGoal() == AverageResponseTime.class){
-                double avgResponseTimeEstimation = 0.0;
-                if (service.getConfiguration().getLoadBalancerType() == ServiceConfiguration.LoadBalancerType.WEIGHTED_RANDOM) {
-                    if (ChangeLoadBalancerWeightsOption.class.equals(adaptationOption.getClass())) {
-                        ChangeLoadBalancerWeightsOption changeLoadBalancerWeightsOption = (ChangeLoadBalancerWeightsOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if(!changeLoadBalancerWeightsOption.getInstancesToShutdownIds().contains(instance.getInstanceId()))
-                                avgResponseTimeEstimation += changeLoadBalancerWeightsOption.getNewWeights().get(instance.getInstanceId()) * instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
-                        }
-                    } else if (AddInstanceOption.class.equals(adaptationOption.getClass())) {
-                        AddInstanceOption addInstanceOption = (AddInstanceOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if(!addInstanceOption.getInstancesToShutdownIds().contains(instance.getInstanceId()))
-                                avgResponseTimeEstimation += addInstanceOption.getOldInstancesNewWeights().get(instance.getInstanceId()) * instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
-                        }
-                        avgResponseTimeEstimation += addInstanceOption.getNewInstanceWeight() * service.getCurrentImplementation().getBenchmark(AverageResponseTime.class);
-                    } else if (ShutdownInstanceOption.class.equals(adaptationOption.getClass())) {
-                        ShutdownInstanceOption shutdownInstanceOption = (ShutdownInstanceOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if (!instance.getInstanceId().equals(shutdownInstanceOption.getInstanceToShutdownId()))
-                                avgResponseTimeEstimation += shutdownInstanceOption.getNewWeights().get(instance.getInstanceId()) * instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
-                        }
-                    }
-
-                }
-                else {
-                    if (AddInstanceOption.class.equals(adaptationOption.getClass())) {
-                        for (Instance instance : instances) {
-                            avgResponseTimeEstimation += instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
-                        }
-                        avgResponseTimeEstimation += service.getCurrentImplementation().getBenchmark(AverageResponseTime.class);
-                        avgResponseTimeEstimation /= instances.size() + 1;
-                    } else if (ShutdownInstanceOption.class.equals(adaptationOption.getClass())) {
-                        ShutdownInstanceOption shutdownInstanceOption = (ShutdownInstanceOption) adaptationOption;
-                        for (Instance instance : instances) {
-                            if (!instance.getInstanceId().equals(shutdownInstanceOption.getInstanceToShutdownId()))
-                                avgResponseTimeEstimation += instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
-                        }
-                        avgResponseTimeEstimation /= instances.size() - 1;
-                    }
-
-                }
-                if(ChangeImplementationOption.class.equals(adaptationOption.getClass())) {
-                    ChangeImplementationOption changeImplementationOption = (ChangeImplementationOption) adaptationOption;
-                    avgResponseTimeEstimation = service.getPossibleImplementations().get(changeImplementationOption.getNewImplementationId()).getBenchmark(AverageResponseTime.class);
-                }
-                double newBenefit =  service.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue() / avgResponseTimeEstimation;
-                log.debug(service.getServiceId() + ": " + adaptationOption.getClass().getSimpleName() + " option for AVG RT. BENEFIT: " + newBenefit);
-                if(newBenefit > 1 && (!benefits.containsKey(AverageResponseTime.class) || newBenefit > benefits.get(AverageResponseTime.class))){
-                    benefits.put(AverageResponseTime.class, newBenefit);
-                    bestOptionForGoal.put(AverageResponseTime.class, adaptationOption);
-                }
-            } else if (adaptationOption.getQosGoal() == Vulnerability.class && (ChangeImplementationOption.class.equals(adaptationOption.getClass()))) {
-                    ChangeImplementationOption changeImplementationOption = (ChangeImplementationOption) adaptationOption;
-                    double vulnerabilityScore = service.getPossibleImplementations().get(changeImplementationOption.getNewImplementationId()).getVulnerabilityScore();
-                    double newBenefit = service.getCurrentVulnerabilityScore() / vulnerabilityScore;
-                    log.debug(service.getServiceId() + ": " + adaptationOption.getClass().getSimpleName() + " option for Vulnerability. BENEFIT: " + newBenefit);
-                    if (newBenefit > 1 && (!benefits.containsKey(Vulnerability.class) || newBenefit > benefits.get(Vulnerability.class))) {
-                        benefits.put(Vulnerability.class, newBenefit);
-                        bestOptionForGoal.put(Vulnerability.class, adaptationOption);
-                    }
-
-            }
-        }
-
-        Class<? extends QoSSpecification> bestBenefitClass = null;
-
-        for (Class<? extends QoSSpecification> qosSpecification : benefits.keySet()) {
-            double newPreference = service.getQoSSpecifications().get(qosSpecification).getWeight();
-            if(bestBenefitClass == null || benefits.get(qosSpecification) * newPreference > benefits.get(bestBenefitClass) * service.getQoSSpecifications().get(bestBenefitClass).getWeight())
-                bestBenefitClass = qosSpecification;
-        }
-        if (bestBenefitClass == null) {
-            log.warn("{}: No beneficial adaptation option", service.getServiceId());
-            return null;
-        }
-
-
-        log.debug("\n\t\t\t\t{}: Selected option {} for {} with benefit {}. \n\t\t\t\tDetails: {}", service.getServiceId(), bestOptionForGoal.get(bestBenefitClass).getClass().getSimpleName(), bestBenefitClass.getSimpleName(), benefits.get(bestBenefitClass), bestOptionForGoal.get(bestBenefitClass));
-        return bestOptionForGoal.get(bestBenefitClass);
-    }
-
     /**
      * Redistributes the weight of an instance that will be shutdown to all the other instances of the service.
      *
@@ -548,6 +440,100 @@ public class PlanService {
             newWeights.put(instanceId, weights.get(instanceId) * (double) oldNumberOfInstances / (double) (oldNumberOfInstances+newNumberOfNewInstances));
         }
         return newWeights;
+    }
+
+    public static String jsonGraph(Map<String, Service> servicesMap, @Nullable AdaptationOption adaptationOption) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        for (Service service : servicesMap.values()) {
+            sb.append("\"").append(service.getServiceId()).append("\":{");
+            sb.append("\"currentImplementationId\":\"").append(service.getCurrentImplementationId()).append("\",");
+
+            sb.append("\"values\":{");
+            for (Class<? extends QoSSpecification> qosClass : service.getQoSSpecifications().keySet()) {
+                sb.append("\"").append(qosClass.getSimpleName()).append("\":").append(getValue(service, adaptationOption, qosClass)).append(",");
+            }
+            sb.deleteCharAt(sb.length() - 1);
+            sb.append("}},");
+        }
+        sb.deleteCharAt(sb.length() - 1);
+
+        Service service = servicesMap.values().iterator().next();
+        sb.append(",\"weights\":{");
+        for (Class<? extends QoSSpecification> qosClass : service.getQoSSpecifications().keySet()) {
+            sb.append("\"").append(qosClass.getSimpleName()).append("\":").append(service.getQoSSpecifications().get(qosClass).getWeight()).append(",");
+        }
+        sb.deleteCharAt(sb.length() - 1);
+        sb.append("}}");
+        return sb.toString();
+    }
+
+    private static Double getValue(Service service, AdaptationOption adaptationOption, Class<? extends QoSSpecification> qosClass) {
+        // TODO handle change weights option
+
+        if (adaptationOption == null || !adaptationOption.getServiceId().equals(service.getServiceId())) {
+            if (qosClass.equals(Availability.class))
+                return service.getCurrentValueForQoS(Availability.class).getDoubleValue();
+            else if (qosClass.equals(AverageResponseTime.class))
+                return service.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
+            else if (qosClass.equals(Vulnerability.class))
+                return service.getCurrentVulnerabilityScore();
+            else return null;
+        }
+
+        if (adaptationOption.getClass().equals(ChangeImplementationOption.class)) {
+            ServiceImplementation currentImplementation = service.getCurrentImplementation();
+            if (qosClass.equals(Vulnerability.class))
+                return currentImplementation.getVulnerabilityScore();
+            else
+                return currentImplementation.getBenchmark(qosClass);
+        }
+
+        if (adaptationOption.getClass().equals(AddInstanceOption.class)) {
+            if (qosClass.equals(Availability.class)) {
+                double newAvailability = 0;
+                for (Instance instance : service.getInstances()) {
+                    newAvailability += instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
+                }
+                newAvailability += service.getCurrentImplementation().getBenchmark(Availability.class);
+                newAvailability /= service.getInstances().size() + 1;
+                return newAvailability;
+            }
+            else if (qosClass.equals(AverageResponseTime.class)) {
+                double newAvgResponseTime = 0;
+                for (Instance instance : service.getInstances()) {
+                    newAvgResponseTime += instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
+                }
+                newAvgResponseTime += service.getCurrentImplementation().getBenchmark(AverageResponseTime.class);
+                newAvgResponseTime /= service.getInstances().size() + 1;
+                return newAvgResponseTime;
+            }
+            else if (qosClass.equals(Vulnerability.class))
+                return service.getCurrentVulnerabilityScore();
+        }
+
+        if (adaptationOption.getClass().equals(ShutdownInstanceOption.class)) {
+            if (qosClass.equals(Availability.class)) {
+                double newAvailability = 0;
+                for (Instance instance : service.getInstances()) {
+                    newAvailability += instance.getCurrentValueForQoS(Availability.class).getDoubleValue();
+                }
+                newAvailability /= service.getInstances().size() - 1;
+                return newAvailability;
+            }
+            else if (qosClass.equals(AverageResponseTime.class)) {
+                double newAvgResponseTime = 0;
+                for (Instance instance : service.getInstances()) {
+                    newAvgResponseTime += instance.getCurrentValueForQoS(AverageResponseTime.class).getDoubleValue();
+                }
+                newAvgResponseTime /= service.getInstances().size() - 1;
+                return newAvgResponseTime;
+            }
+            else if (qosClass.equals(Vulnerability.class))
+                return service.getCurrentVulnerabilityScore();
+        }
+
+        return null;
     }
 
 }

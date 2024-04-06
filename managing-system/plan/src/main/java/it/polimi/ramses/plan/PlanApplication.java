@@ -6,6 +6,9 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cloud.openfeign.EnableFeignClients;
 import org.springframework.util.ResourceUtils;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
 @Slf4j
 @SpringBootApplication
 @EnableFeignClients
@@ -43,6 +46,21 @@ public class PlanApplication {
             } catch (Exception e2) {
                 throw new RuntimeException("Error loading or-tools libraries", e2);
             }
+        }
+
+        // Install PRISM model checker
+        try {
+            ProcessBuilder pb = new ProcessBuilder("./install.sh");
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            String line;
+            while ((line = reader.readLine()) != null)
+                System.out.println(line);
+            p.waitFor();
+            System.out.println("PRISM model checker installed");
+        } catch (Exception e) {
+            throw new RuntimeException("Error installing PRISM model checker", e);
         }
         SpringApplication.run(PlanApplication.class, args);
     }
